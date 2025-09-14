@@ -1,0 +1,127 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.svm import OneClassSVM
+from sklearn.metrics.pairwise import rbf_kernel
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+from sklearn.model_selection import LeaveOneOut
+import seaborn as sns
+from tqdm import tqdm
+
+# ---------------------- Carregar CSV Gerado ---------------------
+df = pd.read_csv("/content/2dados_envase_com_limites.csv")
+df['classe_num'] = df['classe'].map({'em_controle': 1, 'fora_controle': -1})
+
+# ---------------------- Preparar dados ---------------------
+X = df.drop(columns=['classe', 'classe_num']).values
+Y = df['classe_num'].values
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+pca = PCA(n_components=2)
+X_pca = pca.fit_transform(X_scaled)
+
+# Separar treino/teste
+X_train = X_pca[Y == 1]
+X_test = X_pca
+Y_test = Y
+
+# ---------------------- Grade de Parâmetros ---------------------
+sigma_grid = np.linspace(0.1, 3.0, 10)
+nu_grid = np.linspace(0.01, 0.5, 10)
+
+melhor_acc = -np.inf
+melhores_param = (None, None)
+
+# ---------------------- LOO para encontrar melhores parâmetros ---------------------
+loo = LeaveOneOut()
+
+print(" Buscando melhores parâmetros via Leave-One-Out...\n")
+for sigma in tqdm(sigma_grid):
+    for nu in nu_grid:
+        if sigma <= 0 or not (0.01 <= nu <= 0.5):
+            continue
+        gamma = 1 / (2 * sigma**2)
+        preds_val = []
+        true_val = []
+
+        for train_idx, val_idx in loo.split(X_train):
+            X_loo_train, X_loo_val = X_train[train_idx], X_train[val_idx]
+
+            try:
+                model = OneClassSVM(kernel='rbf', gamma=gamma, nu=nu)
+                model.fit(X_loo_train)
+
+                alphas = model.dual_coef_[0]
+                sv = model.support_vectors_
+                rho = np.dot(alphas, np.dot(rbf_kernel(sv, sv, gamma=gamma), alphas))
+                kd_train = np.sqrt(1 - 2 * rbf_kernel(X_loo_train, sv, gamma=gamma) @ alphas + rho)
+                h = np.percentile(kd_train, 95)
+
+                kd_val = np.sqrt(1 - 2 * rbf_kernel(X_loo_val, sv, gamma=gamma) @ alphas + rho)
+                pred = 1 if kd_val < h else -1
+                preds_val.append(pred)
+                true_val.append(1)
+            except:
+                continue
+
+        acc_loo = accuracy_score(true_val, preds_val)
+        if acc_loo > melhor_acc:
+            melhor_acc = acc_loo
+            melhores_param = (sigma, nu)
+
+# ---------------------- Modelo final com melhores parâmetros ---------------------
+sigma_opt, nu_opt = melhores_param
+gamma_opt = 1 / (2 * sigma_opt ** 2)
+
+model = OneClassSVM(kernel='rbf', gamma=gamma_opt, nu=nu_opt)
+model.fit(X_train)
+
+alphas = model.dual_coef_[0]
+sv = model.support_vectors_
+rho = np.dot(alphas, np.dot(rbf_kernel(sv, sv, gamma=gamma_opt), alphas))
+
+kd_test = np.sqrt(1 - 2 * rbf_kernel(X_test, sv, gamma=gamma_opt) @ alphas + rho)
+kd_train = np.sqrt(1 - 2 * rbf_kernel(X_train, sv, gamma=gamma_opt) @ alphas + rho)
+
+h = np.percentile(kd_train, 95)
+preds = np.where(kd_test < h, 1, -1)
+
+# ---------------------- Métricas ---------------------
+acc = accuracy_score(Y_test, preds)
+cm = confusion_matrix(Y_test, preds, labels=[1, -1])
+tn, fp, fn, tp = cm.ravel()
+fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+fnr = fn / (fn + tp) if (fn + tp) > 0 else 0
+arl0 = 1 / fpr if fpr > 0 else float('inf')
+arl1 = 1 / (1 - fnr) if fnr < 1 else float('inf')
+
+print("\n Parâmetros ótimos via Leave-One-Out:")
+print(f"sigma = {sigma_opt:.4f}, nu = {nu_opt:.4f}, gamma = {gamma_opt:.4f}")
+print(f"Acurácia: {acc:.4f}")
+print(f"FPR: {fpr:.4f}, FNR: {fnr:.4f}")
+print(f"ARL0: {arl0:.2f}, ARL1: {arl1:.2f}")
+print("\nMatriz de confusão:")
+print(cm)
+print("\nRelatório:")
+print(classification_report(Y_test, preds, target_names=["Em controle", "Fora de controle"]))
+
+# ---------------------- Gráfico ---------------------
+outliers = kd_test > h
+plt.figure(figsize=(10, 6))
+plt.plot(range(len(kd_test)), kd_test, 'bo-', label="Distâncias ao Centro")
+plt.axhline(y=h, color='red', linestyle='--', label="Limite de Controle (95%)")
+plt.scatter(np.where(outliers)[0], kd_test[outliers], color='red', label="Fora de controle", zorder=5)
+plt.title("Gráfico K - SVDD com LOO aplicado à Simulação de Processo")
+plt.xlabel("Índice da Amostra")
+plt.ylabel("Distância ao Centro do Kernel")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# ---------------------- Amostras mal classificadas ---------------------
+erros = np.where(preds != Y_test)[0]
+print(f"\n Índices das amostras mal classificadas ({len(erros)} erros):")
+print(erros)
