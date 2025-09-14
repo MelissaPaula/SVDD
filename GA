@@ -1,0 +1,138 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.svm import OneClassSVM
+from sklearn.metrics.pairwise import rbf_kernel
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+from sklearn.model_selection import train_test_split
+import seaborn as sns
+from deap import base, creator, tools, algorithms
+import random
+from tqdm import tqdm
+
+# ---------------------- Carregar CSV ----------------------
+df = pd.read_csv("/content/2dados_envase_com_limites.csv")
+df['classe_num'] = df['classe'].map({'em_controle': 1, 'fora_controle': -1})
+
+X = df.drop(columns=['classe', 'classe_num']).values
+Y = df['classe_num'].values
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+pca = PCA(n_components=2)
+X_pca = pca.fit_transform(X_scaled)
+
+X_train = X_pca[Y == 1]  # treino com amostras em controle
+X_test = X_pca
+Y_test = Y
+
+# ---------------------- Função de avaliação GA ----------------------
+def evaluate(individual):
+    sigma, nu = individual
+    if sigma <= 0 or not (0.01 <= nu <= 0.5):
+        return (0.0,)
+
+    gamma = 1 / (2 * sigma**2)
+    try:
+        model = OneClassSVM(kernel='rbf', gamma=gamma, nu=nu)
+        model.fit(X_train)
+
+        alphas = model.dual_coef_[0]
+        sv = model.support_vectors_
+        rho = np.dot(alphas, np.dot(rbf_kernel(sv, sv, gamma=gamma), alphas))
+
+        kd_test = np.sqrt(1 - 2 * rbf_kernel(X_test, sv, gamma=gamma) @ alphas + rho)
+        kd_train = np.sqrt(1 - 2 * rbf_kernel(X_train, sv, gamma=gamma) @ alphas + rho)
+        h = np.percentile(kd_train, 95)
+
+        preds = np.where(kd_test < h, 1, -1)
+        acc = accuracy_score(Y_test, preds)
+
+        return (acc,)
+    except:
+        return (0.0,)
+
+# ---------------------- Setup GA ----------------------
+creator.create("FitnessMax", base.Fitness, weights=(1.0,))  # maximizar acurácia
+creator.create("Individual", list, fitness=creator.FitnessMax)
+
+toolbox = base.Toolbox()
+toolbox.register("attr_sigma", random.uniform, 0.1, 5.0)
+toolbox.register("attr_nu", random.uniform, 0.01, 0.5)
+toolbox.register("individual", tools.initCycle, creator.Individual,
+                 (toolbox.attr_sigma, toolbox.attr_nu), n=1)
+toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+
+toolbox.register("evaluate", evaluate)
+toolbox.register("mate", tools.cxBlend, alpha=0.5)
+toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=0.2, indpb=0.5)
+toolbox.register("select", tools.selTournament, tournsize=3)
+
+# ---------------------- Executar GA ----------------------
+pop = toolbox.population(n=20)
+NGEN = 30
+HALL_OF_FAME = tools.HallOfFame(1)
+
+stats = tools.Statistics(lambda ind: ind.fitness.values)
+stats.register("avg", np.mean)
+stats.register("max", np.max)
+
+pop, log = algorithms.eaSimple(pop, toolbox, cxpb=0.7, mutpb=0.2,
+                               ngen=NGEN, stats=stats, halloffame=HALL_OF_FAME, verbose=True)
+
+best_ind = HALL_OF_FAME[0]
+sigma_opt, nu_opt = best_ind
+gamma_opt = 1 / (2 * sigma_opt ** 2)
+
+# ---------------------- Modelo final com parâmetros ótimos ----------------------
+model = OneClassSVM(kernel='rbf', gamma=gamma_opt, nu=nu_opt)
+model.fit(X_train)
+
+alphas = model.dual_coef_[0]
+sv = model.support_vectors_
+rho = np.dot(alphas, np.dot(rbf_kernel(sv, sv, gamma=gamma_opt), alphas))
+
+kd_test = np.sqrt(1 - 2 * rbf_kernel(X_test, sv, gamma=gamma_opt) @ alphas + rho)
+kd_train = np.sqrt(1 - 2 * rbf_kernel(X_train, sv, gamma=gamma_opt) @ alphas + rho)
+
+h = np.percentile(kd_train, 95)
+preds = np.where(kd_test < h, 1, -1)
+
+# ---------------------- Métricas ----------------------
+acc = accuracy_score(Y_test, preds)
+cm = confusion_matrix(Y_test, preds, labels=[1, -1])
+tn, fp, fn, tp = cm.ravel()
+fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+fnr = fn / (fn + tp) if (fn + tp) > 0 else 0
+arl0 = 1 / fpr if fpr > 0 else float('inf')
+arl1 = 1 / (1 - fnr) if fnr < 1 else float('inf')
+
+print("\n Parâmetros ótimos via GA:")
+print(f"sigma = {sigma_opt:.4f}, nu = {nu_opt:.4f}, gamma = {gamma_opt:.4f}")
+print(f"Acurácia: {acc:.4f}")
+print(f"FPR: {fpr:.4f}, FNR: {fnr:.4f}")
+print(f"ARL0: {arl0:.2f}, ARL1: {arl1:.2f}")
+print("\nMatriz de confusão:")
+print(cm)
+print("\nRelatório:")
+print(classification_report(Y_test, preds, target_names=["Em controle", "Fora de controle"]))
+
+# ---------------------- Gráfico de Controle ----------------------
+outliers = kd_test > h
+plt.figure(figsize=(10, 6))
+plt.plot(range(len(kd_test)), kd_test, 'bo-', label="Distâncias ao Centro")
+plt.axhline(y=h, color='red', linestyle='--', label="Limite de Controle (95%)")
+plt.scatter(np.where(outliers)[0], kd_test[outliers], color='red', label="Fora de controle", zorder=5)
+plt.title("Gráfico K - SVDD com GA aplicado à Simulação de Processo")
+plt.xlabel("Índice da Amostra")
+plt.ylabel("Distância ao Centro do Kernel")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# ---------------------- Erros ----------------------
+erros = np.where(preds != Y_test)[0]
+print(f"\n Índices das amostras mal classificadas ({len(erros)} erros):")
+print(erros)
